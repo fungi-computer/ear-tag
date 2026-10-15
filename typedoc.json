@@ -1,0 +1,13 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "extends": "../../tooling/docs/typedoc.base.json",
+  "name": "@fungi.computer/ear-tag",
+  "entryPoints": [
+    "src/index.ts",
+    "src/grants.ts",
+    "src/keys.ts",
+    "src/keys-node.ts"
+  ],
+  "tsconfig": "tsconfig.json",
+  "out": "docs/api"
+}

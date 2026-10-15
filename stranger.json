@@ -1,0 +1,87 @@
+{
+  "expectedTarballFiles": [
+    "package/LICENSE",
+    "package/README.md",
+    "package/dist/grants.d.ts",
+    "package/dist/grants.js",
+    "package/dist/index.d.ts",
+    "package/dist/index.js",
+    "package/dist/keys.d.ts",
+    "package/dist/keys.js",
+    "package/dist/keys-node.d.ts",
+    "package/dist/keys-node.js",
+    "package/docs/api/README.md",
+    "package/docs/api/grants.md",
+    "package/docs/api/index.md",
+    "package/docs/api/keys.md",
+    "package/docs/api/keys-node.md",
+    "package/package.json"
+  ],
+  "localDependencies": ["../cairn"],
+  "runtimeFixture": "test/stranger/runtime.mjs",
+  "typecheckFixture": "test/stranger/consumer.mts",
+  "docs": {
+    "sigil": "restricted",
+    "home": {
+      "lead": "Random bearer keys and SHA-256 digests, a typed capability-grant vocabulary, and a tenant-scoped key store with issuance, verification and lifecycle, for services issuing invite codes or API keys.",
+      "example": {
+        "file": "home.ts",
+        "title": "Issue a key and its digest",
+        "caption": "Creates a prefixed bearer key and its SHA-256 digest in one call, then prints that the key carries the prefix and the digest is 64 hex characters."
+      },
+      "ladder": {
+        "start": [
+          {
+            "title": "Quickstart",
+            "href": "/quickstart/",
+            "description": "Issue a key, store its digest and hand the key to its one recipient."
+          },
+          {
+            "title": "Core concepts",
+            "href": "/concepts/#core-concepts",
+            "description": "What generateKey, hashKey and generateKeyAndHash each return."
+          }
+        ],
+        "tasks": [
+          {
+            "title": "Issue a key and its digest together",
+            "href": "/api/entry/#generatekeyandhash",
+            "description": "generateKeyAndHash returns { key, digest } in one call."
+          },
+          {
+            "title": "Hash a key you already generated",
+            "href": "/api/entry/#hashkey",
+            "description": "hashKey returns a key's SHA-256 digest as lowercase hex."
+          },
+          {
+            "title": "Declare a capability-grant vocabulary",
+            "href": "/api/grants/",
+            "description": "defineGrants builds the typed grant and scope schemas, and canonicalGrants, grantsAllow, grantsList and isSubset over your capability names."
+          },
+          {
+            "title": "Run a tenant-scoped key store",
+            "href": "/api/keys/",
+            "description": "createKeyStore issues, verifies and manages bearer keys: CAS grant edits, revocation, optional expiry, suspension and rate limits."
+          }
+        ],
+        "reference": [
+          {
+            "title": "API reference",
+            "href": "/api/",
+            "description": "generateKey/hashKey; defineGrants at /api/grants/; createKeyStore at /api/keys/; fromNodeSqlite at /api/keys-node/."
+          },
+          {
+            "title": "Install",
+            "href": "/install/",
+            "description": "The four entrypoints, Web Crypto requirement and Node.js version."
+          },
+          {
+            "title": "Status and limits",
+            "href": "/status/",
+            "description": "Stability, errors and license."
+          }
+        ]
+      }
+    }
+  }
+}
