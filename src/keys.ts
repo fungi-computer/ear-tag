@@ -309,8 +309,10 @@ class Refusal extends Error {
 }
 
 const PREFIX_PATTERN = /^[a-z][a-z0-9]*(?:_[a-z][a-z0-9]*)*$/;
-const prefixSchema = z.string().min(1).max(24).regex(PREFIX_PATTERN);
-const requestIdSchema = z.string().min(1).max(112);
+const prefixSchema = z.lazy(() =>
+  z.string().min(1).max(24).regex(PREFIX_PATTERN),
+);
+const requestIdSchema = z.lazy(() => z.string().min(1).max(112));
 
 type MutationKind = "grants" | "revoke";
 

@@ -92,7 +92,9 @@ export class GrantsDefinitionError extends Error {
   }
 }
 
-const capabilitiesSchema = z.array(z.string().min(1).max(128)).min(1).max(256);
+const capabilitiesSchema = z.lazy(() =>
+  z.array(z.string().min(1).max(128)).min(1).max(256),
+);
 
 function parseImplies<const Capability extends readonly [string, ...string[]]>(
   definition: GrantsDefinition<Capability>,
