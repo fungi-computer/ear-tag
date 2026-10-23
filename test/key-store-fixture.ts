@@ -7,12 +7,19 @@ import {
   type AuthorityFence,
   type IssuerAuthority,
   type KeyStore,
+  type KeyPrincipal,
+  type KeyOutcome,
 } from "../src/keys.js";
 import {
   testVocabulary,
   FIXTURE_CLOCK_START,
   type TestCapability,
 } from "./test-vocabulary.js";
+import {
+  createEpochFixture,
+  type EpochEvent,
+  type EpochFailure,
+} from "./key-epoch.fixture.js";
 
 export function createCommit(
   database: DatabaseSync,
@@ -47,9 +54,20 @@ function mutableClock(start: number) {
 
 /** A key-store test double, built the same way against every SQL backend. */
 export type TestFixture = Readonly<{
-  store: KeyStore<TestCapability>;
+  /** SQL-host methods are synchronous locally; real DO RPC transports them asynchronously. */
+  store: Omit<KeyStore<TestCapability>, "current" | "close"> &
+    Readonly<{
+      current: (
+        principal: KeyPrincipal<TestCapability>,
+      ) =>
+        | KeyOutcome<KeyPrincipal<TestCapability>>
+        | Promise<KeyOutcome<KeyPrincipal<TestCapability>>>;
+      close: (closedAt: number) => KeyOutcome<void> | Promise<KeyOutcome<void>>;
+    }>;
   /** Every authority-change fence recorded so far, in order. */
   fences: () => Promise<readonly AuthorityFence[]>;
+  epochEvents: () => Promise<readonly EpochEvent[]>;
+  failNext: (at: EpochFailure) => Promise<void>;
   /** Move the fixture's virtual clock forward by this many milliseconds. */
   advanceClock: (ms: number) => Promise<void>;
   /** Release any resources the fixture holds. */
@@ -87,10 +105,13 @@ export function createNodeSqliteFixture(
   const database = new DatabaseSync(":memory:");
   const clock = mutableClock(FIXTURE_CLOCK_START);
   const fences: AuthorityFence[] = [];
+  const epochs = createEpochFixture(createCommit(database));
   const store = createKeyStore({
     sql: fromNodeSqlite(database),
-    commit: createCommit(database),
+    commit: epochs.commit,
+    epoch: epochs.epoch,
     vocabulary: testVocabulary,
+    delegation: { manage: "files.manage" },
     prefix: "test",
     authorizeIssuer: authorizeIssuerFor(policy),
     onAuthorityChange: (fence) => {
@@ -101,6 +122,11 @@ export function createNodeSqliteFixture(
   return Promise.resolve({
     store,
     fences: () => Promise.resolve(fences),
+    epochEvents: () => Promise.resolve(epochs.events()),
+    failNext: (at) => {
+      epochs.failNext(at);
+      return Promise.resolve();
+    },
     advanceClock: (ms) => {
       clock.advance(ms);
       return Promise.resolve();

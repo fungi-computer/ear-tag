@@ -14,6 +14,7 @@ import {
 } from "@fungi.computer/ear-tag/grants";
 import {
   createKeyStore,
+  keyWire,
   type KeyOutcome,
   type KeyPrincipal,
   type KeyStore,
@@ -52,6 +53,20 @@ if (issued.kind === "ok") {
   const verified: KeyOutcome<KeyPrincipal<Capability>> = await store.verify(
     issued.value.key,
   );
-  void verified;
+  if (verified.kind === "ok") {
+    const current: KeyOutcome<KeyPrincipal<Capability>> = store.current(
+      verified.value,
+    );
+    const live: KeyOutcome<KeyPrincipal<Capability>> = await store.live({
+      keyId: verified.value.keyId,
+      grantVersion: verified.value.grantVersion,
+    });
+    void [current, live];
+  }
 }
+const wire = keyWire(vocabulary);
+const request = wire.revoke.parse({ keyId: "key-id", requestId: "request-id" });
+void request;
+const closed: KeyOutcome<void> = store.close(Date.now());
+void closed;
 database.close();

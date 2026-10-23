@@ -6,6 +6,8 @@
     "package/dist/grants.js",
     "package/dist/index.d.ts",
     "package/dist/index.js",
+    "package/dist/key-wire.d.ts",
+    "package/dist/key-wire.js",
     "package/dist/keys.d.ts",
     "package/dist/keys.js",
     "package/dist/keys-node.d.ts",
@@ -19,7 +21,11 @@
   ],
   "localDependencies": ["../cairn"],
   "runtimeFixture": "test/stranger/runtime.mjs",
-  "typecheckFixture": "test/stranger/consumer.mts",
+  "typechecks": [
+    {
+      "fixture": "test/stranger/consumer.mts"
+    }
+  ],
   "docs": {
     "sigil": "restricted",
     "home": {

@@ -6,7 +6,7 @@ import {
   hashKey,
 } from "@fungi.computer/ear-tag";
 import { defineGrants } from "@fungi.computer/ear-tag/grants";
-import { createKeyStore } from "@fungi.computer/ear-tag/keys";
+import { createKeyStore, keyWire } from "@fungi.computer/ear-tag/keys";
 import { fromNodeSqlite } from "@fungi.computer/ear-tag/keys/node";
 
 const key = generateKey({ prefix: "test", length: 32 });
@@ -41,6 +41,12 @@ try {
   const verified = await store.verify(issued.value.key);
   assert.equal(verified.kind, "ok");
   assert.equal(verified.value.owner, "owner");
+  assert.deepEqual(store.current(verified.value), verified);
+  assert.deepEqual(await store.live({ keyId: verified.value.keyId }), verified);
+  const summary = keyWire(vocabulary).toSummary(issued.value.record);
+  assert.equal("digest" in summary, false);
+  assert.equal("owner" in summary, false);
+  assert.deepEqual(summary.grants, [grant]);
   const revoked = await store.revoke("owner", {
     requestId: "stranger-revoke",
     keyId: issued.value.record.keyId,
@@ -49,6 +55,11 @@ try {
   const afterRevoke = await store.verify(issued.value.key);
   assert.equal(afterRevoke.kind, "error");
   assert.equal(afterRevoke.error.code, "denied");
+  assert.equal(store.close(Date.now()).kind, "ok");
+  assert.deepEqual(
+    await store.issue("owner", { name: "closed", grants: [grant] }),
+    { kind: "error", error: { code: "denied" } },
+  );
 } finally {
   database.close();
 }

@@ -12,6 +12,38 @@ const vocabulary = defineGrants({
 });
 
 describe("defineGrants", () => {
+  it("K1: implied read authority is listable without widening selected targets", () => {
+    const apps = defineGrants({
+      capabilities: ["apps.read", "apps.use"],
+      implies: { "apps.use": ["apps.read"] },
+    });
+    const selected: readonly Grant<"apps.read" | "apps.use">[] = [
+      {
+        capability: "apps.use",
+        targets: { kind: "selected", ids: ["installation-x"] },
+      },
+    ];
+    expect(apps.grantsAllow(selected, "apps.read", "installation-x")).toBe(
+      true,
+    );
+    expect(apps.grantsAllow(selected, "apps.read", "installation-y")).toBe(
+      false,
+    );
+    expect(apps.grantsList(selected, "apps.read")).toBe(true);
+    expect(
+      apps.grantsList(
+        [{ capability: "apps.use", targets: { kind: "selected", ids: [] } }],
+        "apps.read",
+      ),
+    ).toBe(false);
+    expect(
+      apps.grantsList(
+        [{ capability: "apps.read", targets: { kind: "all" } }],
+        "apps.use",
+      ),
+    ).toBe(false);
+  });
+
   it("rejects a vocabulary with a repeated capability", () => {
     expect(() =>
       defineGrants({ capabilities: ["files.read", "files.read"] as const }),

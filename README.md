@@ -103,7 +103,44 @@ through `issue` or `updateGrants`. It does not narrow which keys that actor may
 `list`, `revoke` or edit: any actor it resolves to a non-null authority for may
 manage every key in the tenant, including keys another actor issued. This
 matches Hub's own `authorizeManage`. `implies` is one level deep, not
-transitive.
+transitive; both `grantsAllow` and `grantsList` honor it without widening a
+selected grant's targets.
+
+Hosts may enable delegated issuance with `delegation: { manage }`. Passing a
+parent principal to `issue` or `updateGrants` requires that key to be live,
+owned by the same human, hold the management capability, and cover every grant
+being assigned. A child cannot outlive its parent at issuance. Revoking the
+parent later does not revoke an already issued child; the human's suspension
+still applies to both.
+
+`live({ keyId, grantVersion? })` rechecks the human issuer and the durable key
+row without spending a rate slot. A version pin refuses a stale grant set.
+`current(principal)` is synchronous for use inside a host resource transaction;
+it checks the row and version, not asynchronous human membership.
+`verify(secret)` consumes a rate slot; `admitUse` rechecks live authority and
+records an exact use receipt. Metadata reads never select the digest.
+
+An optional `epoch: { begin, finish, abort }` fences grant edits and revokes
+against an external admission owner. Each method receives the same decision id.
+A local durable receipt distinguishes an aborted commit from a lost commit
+acknowledgement; exact retries finish the committed decision without mutating
+again. Aborted decisions are terminal: retrying an aborted request does not
+reopen it. Recovery after an abort requires a new `requestId`, which names a new
+epoch decision. A failed finish of a committed request instead retries with the
+original `requestId` and only finishes that decision. `onAuthorityChange` runs
+inside the local commit and carries the transition `kind` and
+`throughGrantVersion`: the replaced version for a grant edit, the current
+version for revocation, suspension or closure.
+
+`close(closedAt)` is synchronous and runs in the host's own transaction. It
+permanently closes the tenant and revokes its keys; reopening the store does not
+permit later issuance or grant edits. Hosts must check its outcome before
+committing their enclosing transaction.
+
+`keyWire(vocabulary)` provides the shared `issue`, `updateGrants` and `revoke`
+request decoders plus `toSummary(record)`. Summaries contain grants and
+lifecycle metadata, never a digest or human owner id. Hosts retain their name,
+identity, expiry, rate-policy and transport authorization rules.
 
 ## API reference
 

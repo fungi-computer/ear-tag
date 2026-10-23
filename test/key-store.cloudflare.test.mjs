@@ -15,6 +15,8 @@ async function createDurableObjectFixture(policy = {}) {
   return {
     store: stub,
     fences: () => stub.fences(),
+    epochEvents: () => stub.epochEvents(),
+    failNext: (at) => stub.failNext(at),
     advanceClock: (ms) => stub.advanceClock(ms),
     close: () => Promise.resolve(),
   };

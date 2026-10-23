@@ -3,6 +3,14 @@ import { z } from "zod";
 
 import { generateKeyAndHash, hashKey } from "./index.js";
 import type { Grant, GrantVocabulary, Scope } from "./grants.js";
+import { keyWire, rateLimitSchema, type KeyRefusalCode } from "./key-wire.js";
+
+export { keyWire, type KeySummary, type KeyWire } from "./key-wire.js";
+export {
+  keyRefusalCodes,
+  keyRefusalSchema,
+  type KeyRefusalCode,
+} from "./key-wire.js";
 
 /** One bound SQL value a key store statement may carry. */
 export type KeySqlValue = string | number | null;
@@ -38,11 +46,6 @@ export type RateLimitPolicy = Readonly<{
   /** Window length, in seconds. */
   windowSeconds: number;
 }>;
-
-const rateLimitSchema: z.ZodType<RateLimitPolicy> = z.strictObject({
-  limit: z.number().int().positive(),
-  windowSeconds: z.number().int().positive(),
-});
 
 /** A stored key's durable state, without its bearer secret. */
 export type KeyRecord<Capability extends string> = Readonly<{
@@ -85,15 +88,6 @@ export type KeyPrincipal<Capability extends string> = Readonly<{
   /** Unix milliseconds after which the key stops verifying, or `null` when unbounded. */
   expiresAt: number | null;
 }>;
-
-/** Stable, closed reasons a key-store operation refuses to proceed. */
-export type KeyRefusalCode =
-  | "invalid"
-  | "denied"
-  | "conflict"
-  | "expired"
-  | "rate_limited"
-  | "unavailable";
 
 /**
  * One closed refusal, carried as data rather than a thrown error type.
@@ -152,10 +146,24 @@ export type AuthorityFence = Readonly<{
   requestId: string;
   /** The affected key. */
   keyId: string;
+  /** The lifecycle transition that changed authority. */
+  kind: "grants" | "revoke" | "suspend" | "close";
+  /** Last grant version whose downstream authority must be invalidated. */
+  throughGrantVersion: number;
   /** The key's grant version after the change. */
   grantVersion: number;
   /** The key's expiry after the change, or `null` when unbounded. */
   expiresAt: number | null;
+}>;
+
+/** Optional external epoch fence around a durable grant edit or revocation. */
+export type AuthorityEpoch = Readonly<{
+  /** Refuse new admissions before the local authority mutation commits. */
+  begin: (decisionId: string) => Promise<void>;
+  /** Complete a committed decision, including recovery of an exact replay. */
+  finish: (decisionId: string) => Promise<void>;
+  /** Release a decision that has no committed local receipt. */
+  abort: (decisionId: string) => Promise<void>;
 }>;
 
 /** Construction options for {@link createKeyStore}. */
@@ -171,7 +179,8 @@ export type CreateKeyStoreOptions<Capability extends string> = Readonly<{
   /**
    * Resolve one actor's authority to issue or edit keys, or `null` to deny
    * the actor outright. The host owns actor identity, role checks, and
-   * re-reading a parent key's live authority.
+   * re-reading the human issuer's live authority. The store rechecks a
+   * delegating key itself when `delegation` is enabled.
    *
    * `"bounded"` only narrows which grants the actor may assign (`issue`,
    * `updateGrants`): it does not narrow which keys they may `list`, `revoke`
@@ -182,6 +191,13 @@ export type CreateKeyStoreOptions<Capability extends string> = Readonly<{
   authorizeIssuer: (
     actorId: string,
   ) => Promise<IssuerAuthority<Capability> | null>;
+  /** Enable key-issued keys using this vocabulary capability to manage keys. */
+  delegation?: Readonly<{
+    /** Capability a live parent must hold without a resource target to delegate keys. */
+    manage: Capability;
+  }>;
+  /** External admission fencing for grant edits and revocations. */
+  epoch?: AuthorityEpoch;
   /** Notified, inside the host's commit, whenever a key's authority changes. */
   onAuthorityChange?: (fence: AuthorityFence) => void;
   /** Clock override for tests; defaults to `Date.now`. */
@@ -199,11 +215,11 @@ export type IssueKeyInput<Capability extends string> = Readonly<{
    * Once an id has been used, including by a now-revoked key, it is never
    * reused: issuing with a reused id refuses `conflict`.
    */
-  keyId?: string;
+  keyId?: string | undefined;
   /** Unix milliseconds after which the key stops verifying; omit for no expiry. */
-  expiresAt?: number;
+  expiresAt?: number | undefined;
   /** The key's own rate policy; omit for unlimited. */
-  rateLimit?: RateLimitPolicy;
+  rateLimit?: RateLimitPolicy | undefined;
 }>;
 
 /** Result of {@link KeyStore}'s `issue`: the bearer secret and its durable record. */
@@ -250,32 +266,28 @@ export type KeyStore<Capability extends string> = Readonly<{
   issue: (
     actorId: string,
     input: IssueKeyInput<Capability>,
+    parent?: KeyPrincipal<Capability>,
   ) => Promise<KeyOutcome<IssuedKey<Capability>>>;
   /** Verify a bearer secret and return its current principal. */
   verify: (secret: string) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
-  /** Re-read a captured principal; refuses once its grant version goes stale. */
+  /** Synchronous version/lifecycle check inside a host's resource transaction. */
   current: (
     principal: KeyPrincipal<Capability>,
+  ) => KeyOutcome<KeyPrincipal<Capability>>;
+  /** Recheck the human issuer and current row, optionally refusing a stale version pin. */
+  live: (
+    ref: Readonly<{ keyId: string; grantVersion?: number }>,
   ) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
   /** List every key, or every key owned by `owner`, once `actorId` is authorized to manage keys. */
   list: (
     actorId: string,
     owner?: string,
   ) => Promise<KeyOutcome<readonly KeyRecord<Capability>[]>>;
-  /**
-   * Read one key's live principal by id, once `actorId` is authorized to
-   * manage keys covering at least this key's own grants. Refuses `denied`
-   * for an unknown, revoked or suspended key and `expired` for one past
-   * its expiry, the same as `verify`.
-   */
-  read: (
-    actorId: string,
-    keyId: string,
-  ) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
   /** Compare-and-swap a key's grants. */
   updateGrants: (
     actorId: string,
     input: UpdateGrantsInput<Capability>,
+    parent?: KeyPrincipal<Capability>,
   ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   /** Tombstone a key; idempotent on repeat. */
   revoke: (
@@ -284,8 +296,8 @@ export type KeyStore<Capability extends string> = Readonly<{
   ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   /** Permanently suspend every key owned by `owner`, for example on its departure. Commits its own write. */
   suspendOwner: (owner: string, requestId: string) => Promise<KeyOutcome<void>>;
-  /** Revoke every still-live key as of `closedAt`. Runs inside the caller's own transaction; it does not commit. */
-  revokeAll: (closedAt: number) => Promise<KeyOutcome<void>>;
+  /** Terminal tenant closure, inside the caller's own transaction; does not commit. */
+  close: (closedAt: number) => KeyOutcome<void>;
   /** Re-verify a capability against a principal's live authority and record one idempotent use receipt. */
   admitUse: (
     principal: KeyPrincipal<Capability>,
@@ -336,6 +348,10 @@ export function createKeyStore<Capability extends string>(
   const now = options.now ?? Date.now;
   const vocabulary = options.vocabulary;
   const sql = options.sql;
+  const manage =
+    options.delegation === undefined
+      ? undefined
+      : vocabulary.capabilityNameSchema.parse(options.delegation.manage);
 
   const ids = defineIdFamily({
     family: "ear-tag",
@@ -347,6 +363,7 @@ export function createKeyStore<Capability extends string>(
   const receiptsTable = `ear_tag_${prefix}_key_receipts`;
   const suspensionsTable = `ear_tag_${prefix}_key_suspensions`;
   const useReceiptsTable = `ear_tag_${prefix}_key_use_receipts`;
+  const lifecycleTable = `ear_tag_${prefix}_key_lifecycle`;
 
   const ensure = (): void => {
     sql.exec(`CREATE TABLE IF NOT EXISTS ${keysTable} (
@@ -377,12 +394,15 @@ export function createKeyStore<Capability extends string>(
       request_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, grant_version INTEGER NOT NULL,
       capability TEXT NOT NULL, target TEXT, at INTEGER NOT NULL
     ) STRICT`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS ${lifecycleTable} (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+      closed_at INTEGER NOT NULL
+    ) STRICT`);
   };
 
   const keyRowSchema = z.strictObject({
     key_id: z.string().min(1).max(256),
     owner: z.string().min(1).max(256),
-    digest: z.string().length(64),
     name: z.string().min(1).max(128),
     grants: z.string(),
     grant_version: z.number().int().positive(),
@@ -394,20 +414,7 @@ export function createKeyStore<Capability extends string>(
     updated_at: z.number().int().nonnegative(),
   });
 
-  const grantsArraySchema = z.array(vocabulary.grantSchema).min(1).max(64);
-  const issueInputSchema = z.strictObject({
-    name: z.string().trim().min(1).max(128),
-    grants: grantsArraySchema,
-    keyId: z.string().min(1).max(256).optional(),
-    expiresAt: z.number().int().positive().optional(),
-    rateLimit: rateLimitSchema.optional(),
-  });
-  const updateGrantsInputSchema = z.strictObject({
-    requestId: requestIdSchema,
-    keyId: z.string().min(1).max(256),
-    expectedGrantVersion: z.number().int().positive(),
-    grants: grantsArraySchema,
-  });
+  const wire = keyWire(vocabulary);
   const keyRecordSchema = z.strictObject({
     keyId: z.string().min(1).max(256),
     owner: z.string().min(1).max(256),
@@ -420,10 +427,6 @@ export function createKeyStore<Capability extends string>(
     lastUsedAt: z.number().int().nonnegative().nullable(),
     createdAt: z.number().int().nonnegative(),
     updatedAt: z.number().int().nonnegative(),
-  });
-  const revokeInputSchema = z.strictObject({
-    requestId: requestIdSchema,
-    keyId: z.string().min(1).max(256),
   });
   const admitUseInputSchema = z.strictObject({
     capability: vocabulary.capabilityNameSchema,
@@ -447,7 +450,17 @@ export function createKeyStore<Capability extends string>(
   });
 
   const columns =
-    "key_id,owner,digest,name,grants,grant_version,expires_at,revoked_at,rate_limit,last_used_at,created_at,updated_at";
+    "key_id,owner,name,grants,grant_version,expires_at,revoked_at,rate_limit,last_used_at,created_at,updated_at";
+
+  const requireOpen = (): void => {
+    ensure();
+    if (
+      sql
+        .exec(`SELECT closed_at FROM ${lifecycleTable} WHERE singleton=1`)
+        .toArray().length > 0
+    )
+      throw new Refusal("denied");
+  };
 
   const decodeScope = (json: string): Scope<Capability> | null => {
     let parsed: unknown;
@@ -515,6 +528,7 @@ export function createKeyStore<Capability extends string>(
   const requireActive = (
     record: KeyRecord<Capability>,
   ): KeyRecord<Capability> & Readonly<{ scope: Scope<Capability> }> => {
+    requireOpen();
     if (record.scope === null) throw new Refusal("denied");
     if (record.revokedAt !== null) throw new Refusal("denied");
     if (isSuspended(record.keyId)) throw new Refusal("denied");
@@ -591,6 +605,45 @@ export function createKeyStore<Capability extends string>(
     return currentImpl(record);
   };
 
+  const liveImpl = async (
+    ref: Readonly<{ keyId: string; grantVersion?: number }>,
+  ): Promise<KeyPrincipal<Capability>> => {
+    const input = z
+      .strictObject({
+        keyId: z.string().min(1).max(256),
+        grantVersion: z.number().int().positive().optional(),
+      })
+      .parse(ref);
+    const record = readById(input.keyId);
+    if (record === null) throw new Refusal("denied");
+    const principal = principalFor(requireActive(record));
+    if (
+      input.grantVersion !== undefined &&
+      input.grantVersion !== principal.grantVersion
+    )
+      throw new Refusal("denied");
+    return currentLiveImpl(principal);
+  };
+
+  const assertParent = (
+    actorId: string,
+    grants: readonly Grant<Capability>[],
+    parent: KeyPrincipal<Capability>,
+    expiresAt?: number | null,
+  ): void => {
+    const live = currentImpl(parent);
+    if (
+      manage === undefined ||
+      live.owner !== actorId ||
+      !vocabulary.grantsAllow(live.scope.grants, manage) ||
+      !vocabulary.isSubset(grants, live.scope.grants) ||
+      (live.expiresAt !== null &&
+        (expiresAt === null ||
+          (expiresAt !== undefined && expiresAt > live.expiresAt)))
+    )
+      throw new Refusal("denied");
+  };
+
   const verifyImpl = async (
     secret: string,
   ): Promise<KeyPrincipal<Capability>> => {
@@ -629,17 +682,26 @@ export function createKeyStore<Capability extends string>(
   const issueImpl = async (
     actorId: string,
     rawInput: unknown,
+    parent?: KeyPrincipal<Capability>,
   ): Promise<IssuedKey<Capability>> => {
-    const input = issueInputSchema.parse(rawInput);
+    const input = wire.issue.parse(rawInput);
     const grants = vocabulary.canonicalGrants(input.grants);
     requireValidScope(grants);
     if (input.expiresAt !== undefined && input.expiresAt <= now())
       throw new Refusal("denied");
     await assertIssuer(actorId, grants);
+    if (parent !== undefined) {
+      await currentLiveImpl(parent);
+      assertParent(actorId, grants, parent, input.expiresAt ?? null);
+    }
     const generated = await generateKeyAndHash({ prefix });
     const createdAt = now();
     const record = await options.commit(() => {
-      ensure();
+      requireOpen();
+      if (input.expiresAt !== undefined && input.expiresAt <= now())
+        throw new Refusal("denied");
+      if (parent !== undefined)
+        assertParent(actorId, grants, parent, input.expiresAt ?? null);
       const keyId = input.keyId ?? ids.key.generate();
       // An id is never reused, including one a now-revoked key already
       // held: revoke tombstones the row rather than deleting it, so it
@@ -648,7 +710,7 @@ export function createKeyStore<Capability extends string>(
       // on key_id is the storage-level backstop behind this refusal.
       if (readById(keyId) !== null) throw new Refusal("conflict");
       sql.exec(
-        `INSERT INTO ${keysTable} (${columns}) VALUES (?,?,?,?,?,1,?,NULL,?,NULL,?,?)`,
+        `INSERT INTO ${keysTable} (key_id,owner,digest,name,grants,grant_version,expires_at,revoked_at,rate_limit,last_used_at,created_at,updated_at) VALUES (?,?,?,?,?,1,?,NULL,?,NULL,?,?)`,
         keyId,
         actorId,
         generated.digest,
@@ -725,107 +787,162 @@ export function createKeyStore<Capability extends string>(
     return prior.metadata;
   };
 
-  const fence = (requestId: string, record: KeyRecord<Capability>): void => {
+  const fence = (
+    requestId: string,
+    kind: AuthorityFence["kind"],
+    record: KeyRecord<Capability>,
+    throughGrantVersion = record.grantVersion,
+  ): void => {
     options.onAuthorityChange?.({
       requestId,
       keyId: record.keyId,
+      kind,
+      throughGrantVersion,
       grantVersion: record.grantVersion,
       expiresAt: record.expiresAt,
     });
   };
 
+  // The host epoch and SQL cannot share a transaction. The durable receipt
+  // distinguishes rollback (abort) from a lost acknowledgement (finish).
+  const commitFencedMutation = async (
+    requestId: string,
+    actorId: string,
+    kind: MutationKind,
+    input: string,
+    preflight: () => KeyRecord<Capability>,
+    write: (record: KeyRecord<Capability>) => KeyRecord<Capability>,
+  ): Promise<KeyRecord<Capability>> => {
+    const decisionId = `${prefix}:${kind}:${requestId}`;
+    if (kind === "grants") requireOpen();
+    const replay = replayMutation(requestId, actorId, kind, input);
+    if (replay !== null) {
+      await options.epoch?.finish(decisionId);
+      return replay;
+    }
+    preflight();
+    await options.epoch?.begin(decisionId);
+    let value: KeyRecord<Capability>;
+    try {
+      value = await options.commit(() => {
+        if (kind === "grants") requireOpen();
+        return (
+          replayMutation(requestId, actorId, kind, input) ?? write(preflight())
+        );
+      });
+    } catch (error) {
+      if (readMutationReceipt(requestId) === null)
+        await options.epoch?.abort(decisionId);
+      else await options.epoch?.finish(decisionId);
+      throw error;
+    }
+    await options.epoch?.finish(decisionId);
+    return value;
+  };
+
   const updateGrantsImpl = async (
     actorId: string,
     rawInput: unknown,
+    parent?: KeyPrincipal<Capability>,
   ): Promise<KeyRecord<Capability>> => {
-    const input = updateGrantsInputSchema.parse(rawInput);
+    const input = wire.updateGrants.parse(rawInput);
     const grants = vocabulary.canonicalGrants(input.grants);
     requireValidScope(grants);
     await assertIssuer(actorId, grants);
+    if (parent !== undefined) {
+      await currentLiveImpl(parent);
+      assertParent(actorId, grants, parent);
+    }
+    ensure();
     const inputKey = JSON.stringify({
       keyId: input.keyId,
       expectedGrantVersion: input.expectedGrantVersion,
       grants,
     });
-    const replay = replayMutation(input.requestId, actorId, "grants", inputKey);
-    if (replay !== null) return replay;
-    return options.commit(() => {
-      const repeated = replayMutation(
-        input.requestId,
-        actorId,
-        "grants",
-        inputKey,
-      );
-      if (repeated !== null) return repeated;
+    const preflight = (): KeyRecord<Capability> => {
+      requireOpen();
+      if (parent !== undefined) assertParent(actorId, grants, parent);
       const current = readById(input.keyId);
       if (current === null) throw new Refusal("denied");
       if (current.revokedAt !== null) throw new Refusal("denied");
       if (current.grantVersion !== input.expectedGrantVersion)
         throw new Refusal("conflict");
-      const updatedAt = now();
-      sql.exec(
-        `UPDATE ${keysTable} SET grants=?,grant_version=grant_version+1,updated_at=? WHERE key_id=? AND grant_version=? AND revoked_at IS NULL`,
-        JSON.stringify({ grants }),
-        updatedAt,
-        input.keyId,
-        input.expectedGrantVersion,
-      );
-      const after = readById(input.keyId);
-      if (after === null) throw new Refusal("conflict");
-      if (after.grantVersion !== input.expectedGrantVersion + 1)
-        throw new Refusal("conflict");
-      fence(input.requestId, after);
-      recordMutationReceipt(input.requestId, {
-        kind: "grants",
-        actorId,
-        input: inputKey,
-        metadata: after,
-      });
-      return after;
-    });
+      return current;
+    };
+    return commitFencedMutation(
+      input.requestId,
+      actorId,
+      "grants",
+      inputKey,
+      preflight,
+      (current) => {
+        const updatedAt = now();
+        sql.exec(
+          `UPDATE ${keysTable} SET grants=?,grant_version=grant_version+1,updated_at=? WHERE key_id=? AND grant_version=? AND revoked_at IS NULL`,
+          JSON.stringify({ grants }),
+          updatedAt,
+          input.keyId,
+          input.expectedGrantVersion,
+        );
+        const after = readById(input.keyId);
+        if (after === null) throw new Refusal("conflict");
+        if (after.grantVersion !== input.expectedGrantVersion + 1)
+          throw new Refusal("conflict");
+        fence(input.requestId, "grants", after, current.grantVersion);
+        recordMutationReceipt(input.requestId, {
+          kind: "grants",
+          actorId,
+          input: inputKey,
+          metadata: after,
+        });
+        return after;
+      },
+    );
   };
 
   const revokeImpl = async (
     actorId: string,
     rawInput: unknown,
   ): Promise<KeyRecord<Capability>> => {
-    const input = revokeInputSchema.parse(rawInput);
+    const input = wire.revoke.parse(rawInput);
     const authority = await options.authorizeIssuer(actorId);
     if (authority === null) throw new Refusal("denied");
+    ensure();
     const inputKey = JSON.stringify({ keyId: input.keyId });
-    const replay = replayMutation(input.requestId, actorId, "revoke", inputKey);
-    if (replay !== null) return replay;
-    return options.commit(() => {
-      const repeated = replayMutation(
-        input.requestId,
-        actorId,
-        "revoke",
-        inputKey,
-      );
-      if (repeated !== null) return repeated;
+    const preflight = (): KeyRecord<Capability> => {
       const current = readById(input.keyId);
       if (current === null) throw new Refusal("denied");
-      if (current.revokedAt === null) {
-        const revokedAt = now();
-        sql.exec(
-          `UPDATE ${keysTable} SET revoked_at=?,updated_at=? WHERE key_id=? AND revoked_at IS NULL`,
-          revokedAt,
-          revokedAt,
-          current.keyId,
-        );
-      }
-      const revoked = readById(current.keyId);
-      if (revoked === null) throw new Refusal("conflict");
-      if (revoked.revokedAt === null) throw new Refusal("conflict");
-      fence(input.requestId, revoked);
-      recordMutationReceipt(input.requestId, {
-        kind: "revoke",
-        actorId,
-        input: inputKey,
-        metadata: revoked,
-      });
-      return revoked;
-    });
+      return current;
+    };
+    return commitFencedMutation(
+      input.requestId,
+      actorId,
+      "revoke",
+      inputKey,
+      preflight,
+      (current) => {
+        if (current.revokedAt === null) {
+          const revokedAt = now();
+          sql.exec(
+            `UPDATE ${keysTable} SET revoked_at=?,updated_at=? WHERE key_id=? AND revoked_at IS NULL`,
+            revokedAt,
+            revokedAt,
+            current.keyId,
+          );
+        }
+        const revoked = readById(current.keyId);
+        if (revoked === null) throw new Refusal("conflict");
+        if (revoked.revokedAt === null) throw new Refusal("conflict");
+        fence(input.requestId, "revoke", revoked);
+        recordMutationReceipt(input.requestId, {
+          kind: "revoke",
+          actorId,
+          input: inputKey,
+          metadata: revoked,
+        });
+        return revoked;
+      },
+    );
   };
 
   const listImpl = async (
@@ -849,17 +966,6 @@ export function createKeyStore<Capability extends string>(
             )
             .toArray();
     return rows.map(decode);
-  };
-
-  const readImpl = async (
-    actorId: string,
-    keyId: string,
-  ): Promise<KeyPrincipal<Capability>> => {
-    const record = readById(keyId);
-    if (record === null) throw new Refusal("denied");
-    const active = requireActive(record);
-    await assertIssuer(actorId, active.scope.grants);
-    return principalFor(active);
   };
 
   const admitUseImpl = async (
@@ -922,14 +1028,20 @@ export function createKeyStore<Capability extends string>(
         );
         fence(
           JSON.stringify(["owner-suspension", requestId, record.keyId]),
+          "suspend",
           record,
         );
       }
     });
   };
 
-  const revokeAllImpl = (closedAt: number): void => {
+  const closeImpl = (closedAt: number): void => {
+    z.number().int().nonnegative().parse(closedAt);
     ensure();
+    sql.exec(
+      `INSERT OR IGNORE INTO ${lifecycleTable} (singleton,closed_at) VALUES (1,?)`,
+      closedAt,
+    );
     const rows = sql
       .exec(`SELECT ${columns} FROM ${keysTable} WHERE revoked_at IS NULL`)
       .toArray()
@@ -946,7 +1058,11 @@ export function createKeyStore<Capability extends string>(
       // naming a now-revoked key must never read as still live.
       const revoked = readById(record.keyId);
       if (revoked !== null)
-        fence(JSON.stringify(["revoke-all", closedAt, record.keyId]), revoked);
+        fence(
+          JSON.stringify(["close", closedAt, record.keyId]),
+          "close",
+          revoked,
+        );
     }
   };
 
@@ -993,20 +1109,34 @@ export function createKeyStore<Capability extends string>(
     }
   };
 
+  const syncBoundary = <Value>(operation: () => Value): KeyOutcome<Value> => {
+    try {
+      return { kind: "ok", value: operation() };
+    } catch (error) {
+      if (error instanceof Refusal)
+        return { kind: "error", error: { code: error.code } };
+      if (error instanceof z.ZodError)
+        return { kind: "error", error: { code: "invalid" } };
+      console.error("Ear Tag key store: unexpected failure", error);
+      return { kind: "error", error: { code: "unavailable" } };
+    }
+  };
+
   return {
-    issue: (actorId, input) => boundary(() => issueImpl(actorId, input)),
+    issue: (actorId, input, parent) =>
+      boundary(() => issueImpl(actorId, input, parent)),
     verify: (secret) => boundary(() => verifyImpl(secret)),
-    current: (principal) => boundary(() => currentImpl(principal)),
+    current: (principal) => syncBoundary(() => currentImpl(principal)),
+    live: (ref) => boundary(() => liveImpl(ref)),
     list: (actorId, owner) => boundary(() => listImpl(actorId, owner)),
-    read: (actorId, keyId) => boundary(() => readImpl(actorId, keyId)),
-    updateGrants: (actorId, input) =>
-      boundary(() => updateGrantsImpl(actorId, input)),
+    updateGrants: (actorId, input, parent) =>
+      boundary(() => updateGrantsImpl(actorId, input, parent)),
     revoke: (actorId, input) => boundary(() => revokeImpl(actorId, input)),
     suspendOwner: (owner, requestId) =>
       boundary(() => suspendOwnerImpl(owner, requestId)),
-    revokeAll: (closedAt) =>
-      boundary(() => {
-        revokeAllImpl(closedAt);
+    close: (closedAt) =>
+      syncBoundary(() => {
+        closeImpl(closedAt);
       }),
     admitUse: (principal, input) =>
       boundary(() => admitUseImpl(principal, input)),

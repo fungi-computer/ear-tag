@@ -7,6 +7,7 @@ import {
   type FixturePolicy,
 } from "./key-store-fixture.js";
 import type { TestCapability } from "./test-vocabulary.js";
+import type { EpochFailure } from "./key-epoch.fixture.js";
 
 const readGrant: Grant<TestCapability> = {
   capability: "files.read",
@@ -28,6 +29,521 @@ function idRange(prefix: string, count: number): readonly string[] {
  */
 export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
   const create = (policy?: FixturePolicy) => createFixture(policy);
+
+  const epochFailures: readonly EpochFailure[] = [
+    "begin",
+    "before-commit",
+    "after-commit",
+  ];
+  for (const failure of epochFailures)
+    it(`K4: ${failure} failure recovers without reopening an aborted decision`, async () => {
+      const { store, epochEvents, fences, failNext, close } = await create();
+      try {
+        const issued = await store.issue("owner-a", {
+          name: "epoch recovery",
+          grants: [readGrant],
+        });
+        if (issued.kind !== "ok") throw new Error("issue failed");
+        const input = {
+          requestId: "epoch-recovery",
+          keyId: issued.value.record.keyId,
+          expectedGrantVersion: 1,
+          grants: [readGrant],
+        };
+        const start = (await epochEvents()).length;
+        await failNext(failure);
+        expect(await store.updateGrants("owner-a", input)).toEqual({
+          kind: "error",
+          error: { code: "unavailable" },
+        });
+        const failed = (await epochEvents()).slice(start);
+        expect(failed.map((event) => event.kind)).toEqual(
+          failure === "begin"
+            ? ["begin"]
+            : [
+                "begin",
+                "commit",
+                failure === "before-commit" ? "abort" : "finish",
+              ],
+        );
+        const firstDecision = failed[0]?.decisionId;
+        expect(firstDecision).toBeTypeOf("string");
+        if (failure === "before-commit") {
+          const refusedStart = (await epochEvents()).length;
+          expect(await store.updateGrants("owner-a", input)).toEqual({
+            kind: "error",
+            error: { code: "unavailable" },
+          });
+          expect((await epochEvents()).slice(refusedStart)).toEqual([
+            { kind: "begin", decisionId: firstDecision },
+          ]);
+          expect(await fences()).toHaveLength(0);
+        }
+        const retryStart = (await epochEvents()).length;
+        const repaired = await store.updateGrants("owner-a", {
+          ...input,
+          // No receipt committed: the aborted decision is terminal, so
+          // recovery is a new request, not an exact replay of that decision.
+          requestId:
+            failure === "before-commit"
+              ? `${input.requestId}-after-abort`
+              : input.requestId,
+        });
+        expect(repaired.kind).toBe("ok");
+        if (repaired.kind !== "ok") throw new Error("repair failed");
+        expect(repaired.value.grantVersion).toBe(2);
+        const repairedEvents = (await epochEvents()).slice(retryStart);
+        expect(repairedEvents.map((event) => event.kind)).toEqual(
+          failure === "after-commit"
+            ? ["finish"]
+            : ["begin", "commit", "finish"],
+        );
+        if (failure === "before-commit")
+          expect(repairedEvents.at(-1)?.decisionId).not.toBe(firstDecision);
+        else expect(repairedEvents.at(-1)?.decisionId).toBe(firstDecision);
+        expect(await fences()).toHaveLength(1);
+      } finally {
+        await close();
+      }
+    });
+
+  it("K4: a failed finish retains the external fence until committed replay finishes it", async () => {
+    const { store, epochEvents, fences, failNext, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "finish recovery",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const input = {
+        requestId: "finish-recovery",
+        keyId: issued.value.record.keyId,
+        expectedGrantVersion: 1,
+        grants: [readGrant],
+      };
+      const start = (await epochEvents()).length;
+      await failNext("finish");
+      expect(await store.updateGrants("owner-a", input)).toEqual({
+        kind: "error",
+        error: { code: "unavailable" },
+      });
+      const failed = (await epochEvents()).slice(start);
+      expect(failed.map((event) => event.kind)).toEqual([
+        "begin",
+        "commit",
+        "finish",
+      ]);
+      const decisionId = failed[0]?.decisionId;
+      expect(decisionId).toBeTypeOf("string");
+      const committed = await store.list("owner-a");
+      expect(committed.kind).toBe("ok");
+      if (committed.kind !== "ok") throw new Error("committed key missing");
+      const metadata = committed.value[0];
+      if (metadata === undefined) throw new Error("committed key missing");
+      expect(metadata.grantVersion).toBe(2);
+      expect(await fences()).toHaveLength(1);
+
+      // The owner still has a pending decision: a different mutation cannot
+      // begin, despite the original mutation having committed locally.
+      const next = {
+        ...input,
+        requestId: "after-finish-recovery",
+        expectedGrantVersion: 2,
+      };
+      const blockedStart = (await epochEvents()).length;
+      expect(await store.updateGrants("owner-a", next)).toEqual({
+        kind: "error",
+        error: { code: "unavailable" },
+      });
+      const blocked = (await epochEvents()).slice(blockedStart);
+      expect(blocked.map((event) => event.kind)).toEqual(["begin"]);
+      expect(blocked[0]?.decisionId).not.toBe(decisionId);
+      expect(await fences()).toHaveLength(1);
+
+      const replayStart = (await epochEvents()).length;
+      expect(await store.updateGrants("owner-a", input)).toEqual({
+        kind: "ok",
+        value: metadata,
+      });
+      expect((await epochEvents()).slice(replayStart)).toEqual([
+        { kind: "finish", decisionId },
+      ]);
+      expect(await fences()).toHaveLength(1);
+
+      const nextStart = (await epochEvents()).length;
+      const resumed = await store.updateGrants("owner-a", next);
+      expect(resumed.kind).toBe("ok");
+      if (resumed.kind !== "ok") throw new Error("fence was not released");
+      expect(resumed.value.grantVersion).toBe(3);
+      const resumedEvents = (await epochEvents()).slice(nextStart);
+      expect(resumedEvents.map((event) => event.kind)).toEqual([
+        "begin",
+        "commit",
+        "finish",
+      ]);
+      expect(resumedEvents[0]?.decisionId).toBe(blocked[0]?.decisionId);
+      expect(await fences()).toHaveLength(2);
+    } finally {
+      await close();
+    }
+  });
+
+  it("K4: an exact replay only finishes the original epoch decision", async () => {
+    const { store, epochEvents, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "epoch replay",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const input = {
+        requestId: "epoch-replay",
+        keyId: issued.value.record.keyId,
+        expectedGrantVersion: 1,
+        grants: [readGrant],
+      };
+      const start = (await epochEvents()).length;
+      const first = await store.updateGrants("owner-a", input);
+      expect(first.kind).toBe("ok");
+      const changed = (await epochEvents()).slice(start);
+      expect(changed.map((event) => event.kind)).toEqual([
+        "begin",
+        "commit",
+        "finish",
+      ]);
+      const retryStart = (await epochEvents()).length;
+      expect(await store.updateGrants("owner-a", input)).toEqual(first);
+      expect((await epochEvents()).slice(retryStart)).toEqual([
+        { kind: "finish", decisionId: changed[0]?.decisionId },
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("K6: live and current recheck without using a verification rate slot", async () => {
+    const { store, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "rate limited",
+        grants: [readGrant],
+        rateLimit: { limit: 1, windowSeconds: 60 },
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const verified = await store.verify(issued.value.key);
+      if (verified.kind !== "ok") throw new Error("verify failed");
+      const ref = {
+        keyId: verified.value.keyId,
+        grantVersion: verified.value.grantVersion,
+      };
+      expect(await store.live(ref)).toEqual(verified);
+      expect(await store.current(verified.value)).toEqual(verified);
+      expect(await store.live(ref)).toEqual(verified);
+      expect(await store.verify(issued.value.key)).toEqual({
+        kind: "error",
+        error: { code: "rate_limited", retryAfterSeconds: 60 },
+      });
+      await store.updateGrants("owner-a", {
+        requestId: "narrow-after-list",
+        keyId: ref.keyId,
+        expectedGrantVersion: 1,
+        grants: [
+          {
+            capability: "files.read",
+            targets: { kind: "selected", ids: ["file-a"] },
+          },
+        ],
+      });
+      expect(await store.live(ref)).toEqual({
+        kind: "error",
+        error: { code: "denied" },
+      });
+      const fresh = await store.live({ keyId: ref.keyId });
+      expect(fresh.kind).toBe("ok");
+      if (fresh.kind === "ok") expect(fresh.value.grantVersion).toBe(2);
+    } finally {
+      await close();
+    }
+  });
+
+  it("K5: a grant edit fences the replaced version, while revoke fences the current version", async () => {
+    const { store, fences, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "fenced-key",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const keyId = issued.value.record.keyId;
+      expect(
+        (
+          await store.updateGrants("owner-a", {
+            requestId: "edit-fenced-key",
+            keyId,
+            expectedGrantVersion: 1,
+            grants: [readGrant],
+          })
+        ).kind,
+      ).toBe("ok");
+      expect(await fences()).toEqual([
+        {
+          requestId: "edit-fenced-key",
+          keyId,
+          kind: "grants",
+          throughGrantVersion: 1,
+          grantVersion: 2,
+          expiresAt: null,
+        },
+      ]);
+      await store.revoke("owner-a", {
+        requestId: "revoke-fenced-key",
+        keyId,
+      });
+      expect((await fences())[1]).toEqual({
+        requestId: "revoke-fenced-key",
+        keyId,
+        kind: "revoke",
+        throughGrantVersion: 2,
+        grantVersion: 2,
+        expiresAt: null,
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K3: tenant closure is terminal even for an authorized issuer", async () => {
+    const { store, close } = await create();
+    try {
+      expect((await store.close(FIXTURE_CLOCK_START)).kind).toBe("ok");
+      expect(
+        await store.issue("owner-a", {
+          name: "after-close",
+          grants: [readGrant],
+        }),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K3: closure refuses both new grant edits and replays of earlier edits", async () => {
+    const { store, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "closed edits",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const edit = {
+        requestId: "before-close",
+        keyId: issued.value.record.keyId,
+        expectedGrantVersion: 1,
+        grants: [readGrant],
+      };
+      expect((await store.updateGrants("owner-a", edit)).kind).toBe("ok");
+      expect((await store.close(FIXTURE_CLOCK_START)).kind).toBe("ok");
+      expect(await store.updateGrants("owner-a", edit)).toEqual({
+        kind: "error",
+        error: { code: "denied" },
+      });
+      expect(
+        await store.updateGrants("owner-a", {
+          ...edit,
+          requestId: "after-close",
+          expectedGrantVersion: 2,
+        }),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K2: a delegated key cannot exceed its live parent's grants or expiry", async () => {
+    const { store, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "parent",
+        grants: [
+          { capability: "files.manage", targets: { kind: "all" } },
+          {
+            capability: "files.read",
+            targets: { kind: "selected", ids: ["file-a"] },
+          },
+        ],
+        expiresAt: FIXTURE_CLOCK_START + 10_000,
+      });
+      if (issued.kind !== "ok") throw new Error("parent issue failed");
+      const parent = await store.verify(issued.value.key);
+      if (parent.kind !== "ok") throw new Error("parent verification failed");
+      const outside = await store.issue(
+        "owner-a",
+        {
+          name: "outside",
+          grants: [readGrant],
+          expiresAt: FIXTURE_CLOCK_START + 5_000,
+        },
+        parent.value,
+      );
+      expect(outside).toEqual({ kind: "error", error: { code: "denied" } });
+      const later = await store.issue(
+        "owner-a",
+        {
+          name: "later",
+          grants: [
+            {
+              capability: "files.read",
+              targets: { kind: "selected", ids: ["file-a"] },
+            },
+          ],
+          expiresAt: FIXTURE_CLOCK_START + 20_000,
+        },
+        parent.value,
+      );
+      expect(later).toEqual({ kind: "error", error: { code: "denied" } });
+      const unbounded = await store.issue(
+        "owner-a",
+        {
+          name: "unbounded",
+          grants: [
+            {
+              capability: "files.read",
+              targets: { kind: "selected", ids: ["file-a"] },
+            },
+          ],
+        },
+        parent.value,
+      );
+      expect(unbounded).toEqual({ kind: "error", error: { code: "denied" } });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K2: delegated issuance requires manage authority and the same human owner", async () => {
+    const { store, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "reader",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("parent issue failed");
+      const parent = await store.verify(issued.value.key);
+      if (parent.kind !== "ok") throw new Error("parent verification failed");
+      expect(
+        await store.issue(
+          "owner-a",
+          { name: "no-manage", grants: [readGrant] },
+          parent.value,
+        ),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+      const manager = await store.issue("owner-a", {
+        name: "manager",
+        grants: [
+          { capability: "files.manage", targets: { kind: "all" } },
+          readGrant,
+        ],
+      });
+      if (manager.kind !== "ok") throw new Error("manager issue failed");
+      const managerPrincipal = await store.verify(manager.value.key);
+      if (managerPrincipal.kind !== "ok")
+        throw new Error("manager verify failed");
+      expect(
+        await store.issue(
+          "owner-b",
+          { name: "different-human", grants: [readGrant] },
+          managerPrincipal.value,
+        ),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K2: a grant edit delegated by a key cannot widen beyond that parent's live grants", async () => {
+    const { store, close } = await create();
+    try {
+      const manager = await store.issue("owner-a", {
+        name: "manager",
+        grants: [
+          { capability: "files.manage", targets: { kind: "all" } },
+          {
+            capability: "files.read",
+            targets: { kind: "selected", ids: ["file-a"] },
+          },
+        ],
+      });
+      const child = await store.issue("owner-a", {
+        name: "child",
+        grants: [
+          {
+            capability: "files.read",
+            targets: { kind: "selected", ids: ["file-a"] },
+          },
+        ],
+      });
+      if (manager.kind !== "ok" || child.kind !== "ok")
+        throw new Error("issue failed");
+      const parent = await store.verify(manager.value.key);
+      if (parent.kind !== "ok") throw new Error("parent verification failed");
+      expect(
+        await store.updateGrants(
+          "owner-a",
+          {
+            requestId: "widen-child",
+            keyId: child.value.record.keyId,
+            expectedGrantVersion: 1,
+            grants: [readGrant],
+          },
+          parent.value,
+        ),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+    } finally {
+      await close();
+    }
+  });
+
+  it("K2: revoking a parent leaves its issued child live but human suspension does not", async () => {
+    const { store, close } = await create();
+    try {
+      const issued = await store.issue("owner-a", {
+        name: "parent",
+        grants: [
+          { capability: "files.manage", targets: { kind: "all" } },
+          readGrant,
+        ],
+      });
+      if (issued.kind !== "ok") throw new Error("parent issue failed");
+      const parent = await store.verify(issued.value.key);
+      if (parent.kind !== "ok") throw new Error("parent verification failed");
+      const child = await store.issue(
+        "owner-a",
+        { name: "child", grants: [readGrant] },
+        parent.value,
+      );
+      if (child.kind !== "ok") throw new Error("child issue failed");
+      const revoked = await store.revoke("owner-a", {
+        requestId: "revoke-parent",
+        keyId: parent.value.keyId,
+      });
+      expect(revoked.kind).toBe("ok");
+      expect((await store.verify(child.value.key)).kind).toBe("ok");
+      expect(
+        await store.issue(
+          "owner-a",
+          { name: "after-revoke", grants: [readGrant] },
+          parent.value,
+        ),
+      ).toEqual({ kind: "error", error: { code: "denied" } });
+      await store.suspendOwner("owner-a", "suspend-human");
+      expect(await store.verify(child.value.key)).toEqual({
+        kind: "error",
+        error: { code: "denied" },
+      });
+    } finally {
+      await close();
+    }
+  });
 
   it("issues a key and verifies it back to the same principal", async () => {
     const { store, close } = await create();
@@ -176,12 +692,16 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       expect(await fences()).toEqual([
         {
           requestId: "req-fence-grants",
+          kind: "grants",
+          throughGrantVersion: 1,
           keyId,
           grantVersion: 2,
           expiresAt: null,
         },
         {
           requestId: "req-fence-revoke",
+          kind: "revoke",
+          throughGrantVersion: 2,
           keyId,
           grantVersion: 2,
           expiresAt: null,
@@ -509,7 +1029,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       expect(touched.kind).toBe("ok");
 
       const closedAt = 123;
-      const closed = await store.revokeAll(closedAt);
+      const closed = await store.close(closedAt);
       expect(closed.kind).toBe("ok");
       const verified = await store.verify(issued.value.key);
       expect(verified).toEqual({ kind: "error", error: { code: "denied" } });
@@ -700,7 +1220,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
     }
   });
 
-  it("issues a key with a caller-chosen id, and it round-trips through verify and read", async () => {
+  it("issues a key with a caller-chosen id, and it round-trips through verify and live", async () => {
     const { store, close } = await create();
     try {
       const issued = await store.issue("owner-a", {
@@ -725,7 +1245,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
         },
       });
 
-      const read = await store.read("owner-a", "chosen-key-1");
+      const read = await store.live({ keyId: "chosen-key-1" });
       expect(read).toEqual(verified);
     } finally {
       await close();
@@ -772,7 +1292,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
     }
   });
 
-  it("refuses to read a revoked key", async () => {
+  it("refuses live authority for a revoked key", async () => {
     const { store, close } = await create();
     try {
       const issued = await store.issue("owner-a", {
@@ -787,14 +1307,14 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       });
       expect(revoked.kind).toBe("ok");
 
-      const read = await store.read("owner-a", keyId);
+      const read = await store.live({ keyId });
       expect(read).toEqual({ kind: "error", error: { code: "denied" } });
     } finally {
       await close();
     }
   });
 
-  it("refuses to read an expired key", async () => {
+  it("refuses live authority for an expired key", async () => {
     const { store, close, advanceClock } = await create();
     try {
       const issued = await store.issue("owner-a", {
@@ -805,14 +1325,14 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       if (issued.kind !== "ok") throw new Error("issue failed");
       await advanceClock(2_000);
 
-      const read = await store.read("owner-a", issued.value.record.keyId);
+      const read = await store.live({ keyId: issued.value.record.keyId });
       expect(read).toEqual({ kind: "error", error: { code: "expired" } });
     } finally {
       await close();
     }
   });
 
-  it("refuses to read a key whose owner is suspended", async () => {
+  it("refuses live authority for a key whose owner is suspended", async () => {
     const { store, close } = await create();
     try {
       const issued = await store.issue("owner-a", {
@@ -826,7 +1346,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       );
       expect(suspension.kind).toBe("ok");
 
-      const read = await store.read("owner-a", issued.value.record.keyId);
+      const read = await store.live({ keyId: issued.value.record.keyId });
       expect(read).toEqual({ kind: "error", error: { code: "denied" } });
     } finally {
       await close();

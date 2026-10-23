@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { createKeyStore } from "../src/keys.js";
 import { testVocabulary, FIXTURE_CLOCK_START } from "./test-vocabulary.js";
+import { createEpochFixture } from "./key-epoch.fixture.js";
 
 /**
  * A real Durable Object wrapping `createKeyStore` over its own
@@ -20,13 +21,19 @@ export class KeyStoreDO extends DurableObject {
   #now = FIXTURE_CLOCK_START;
   #fences = [];
   #store;
+  #epochs;
 
   constructor(ctx, env) {
     super(ctx, env);
+    this.#epochs = createEpochFixture((body) =>
+      Promise.resolve(ctx.storage.transactionSync(body)),
+    );
     this.#store = createKeyStore({
       sql: ctx.storage.sql,
-      commit: (body) => Promise.resolve(ctx.storage.transactionSync(body)),
+      commit: this.#epochs.commit,
+      epoch: this.#epochs.epoch,
       vocabulary: testVocabulary,
+      delegation: { manage: "files.manage" },
       prefix: "test",
       authorizeIssuer: (actorId) => {
         if (this.#policy.deny.has(actorId)) return Promise.resolve(null);
@@ -62,8 +69,16 @@ export class KeyStoreDO extends DurableObject {
     return this.#fences;
   }
 
-  issue(actorId, input) {
-    return this.#store.issue(actorId, input);
+  epochEvents() {
+    return this.#epochs.events();
+  }
+
+  failNext(at) {
+    this.#epochs.failNext(at);
+  }
+
+  issue(actorId, input, parent) {
+    return this.#store.issue(actorId, input, parent);
   }
 
   verify(secret) {
@@ -78,12 +93,12 @@ export class KeyStoreDO extends DurableObject {
     return this.#store.list(actorId, owner);
   }
 
-  read(actorId, keyId) {
-    return this.#store.read(actorId, keyId);
+  live(ref) {
+    return this.#store.live(ref);
   }
 
-  updateGrants(actorId, input) {
-    return this.#store.updateGrants(actorId, input);
+  updateGrants(actorId, input, parent) {
+    return this.#store.updateGrants(actorId, input, parent);
   }
 
   revoke(actorId, input) {
@@ -94,8 +109,8 @@ export class KeyStoreDO extends DurableObject {
     return this.#store.suspendOwner(owner, requestId);
   }
 
-  revokeAll(closedAt) {
-    return this.#store.revokeAll(closedAt);
+  close(closedAt) {
+    return this.#store.close(closedAt);
   }
 
   admitUse(principal, input) {

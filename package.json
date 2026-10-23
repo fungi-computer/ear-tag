@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/ear-tag",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Worker-safe bearer-key generation and hashing primitives",
   "type": "module",

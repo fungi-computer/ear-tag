@@ -10,6 +10,56 @@
 
 ## Type Aliases
 
+### KeyRefusalCode
+
+```ts
+type KeyRefusalCode = (typeof keyRefusalCodes)[number];
+```
+
+Stable, closed reasons a key-store operation refuses to proceed.
+
+---
+
+### KeySummary
+
+```ts
+type KeySummary<Capability> = Readonly<
+  Omit<KeyRecord<Capability>, "owner" | "scope"> & object
+>;
+```
+
+Owner-facing key metadata; neither the human owner id nor digest is exposed.
+
+#### Type Parameters
+
+| Type Parameter                  |
+| ------------------------------- |
+| `Capability` _extends_ `string` |
+
+---
+
+### KeyWire
+
+```ts
+type KeyWire<Capability> = Readonly<{
+  issue: z.ZodType<IssueKeyInput<Capability>>;
+  updateGrants: z.ZodType<UpdateGrantsInput<Capability>>;
+  revoke: z.ZodType<RevokeInput>;
+  summary: z.ZodType<KeySummary<Capability>>;
+  toSummary: (record) => KeySummary<Capability>;
+}>;
+```
+
+Shared request decoders and secret-free key metadata for host transports.
+
+#### Type Parameters
+
+| Type Parameter                  |
+| ------------------------------- |
+| `Capability` _extends_ `string` |
+
+---
+
 ### KeySqlValue
 
 ```ts
@@ -122,22 +172,6 @@ A verified bearer credential: a live key's identity and current authority.
 
 ---
 
-### KeyRefusalCode
-
-```ts
-type KeyRefusalCode =
-  | "invalid"
-  | "denied"
-  | "conflict"
-  | "expired"
-  | "rate_limited"
-  | "unavailable";
-```
-
-Stable, closed reasons a key-store operation refuses to proceed.
-
----
-
 ### KeyRefusal
 
 ```ts
@@ -215,6 +249,8 @@ grants, checked with the vocabulary's `isSubset`.
 type AuthorityFence = Readonly<{
   requestId: string;
   keyId: string;
+  kind: "grants" | "revoke" | "suspend" | "close";
+  throughGrantVersion: number;
   grantVersion: number;
   expiresAt: number | null;
 }>;
@@ -222,6 +258,20 @@ type AuthorityFence = Readonly<{
 
 One durable notice that a key's authority changed, for a host's own downstream
 fencing.
+
+---
+
+### AuthorityEpoch
+
+```ts
+type AuthorityEpoch = Readonly<{
+  begin: (decisionId) => Promise<void>;
+  finish: (decisionId) => Promise<void>;
+  abort: (decisionId) => Promise<void>;
+}>;
+```
+
+Optional external epoch fence around a durable grant edit or revocation.
 
 ---
 
@@ -234,6 +284,10 @@ type CreateKeyStoreOptions<Capability> = Readonly<{
   vocabulary: GrantVocabulary<Capability>;
   prefix: string;
   authorizeIssuer: (actorId) => Promise<IssuerAuthority<Capability> | null>;
+  delegation?: Readonly<{
+    manage: Capability;
+  }>;
+  epoch?: AuthorityEpoch;
   onAuthorityChange?: (fence) => void;
   now?: () => number;
 }>;
@@ -351,18 +405,26 @@ admission.
 
 ```ts
 type KeyStore<Capability> = Readonly<{
-  issue: (actorId, input) => Promise<KeyOutcome<IssuedKey<Capability>>>;
+  issue: (
+    actorId,
+    input,
+    parent?,
+  ) => Promise<KeyOutcome<IssuedKey<Capability>>>;
   verify: (secret) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
-  current: (principal) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
+  current: (principal) => KeyOutcome<KeyPrincipal<Capability>>;
+  live: (ref) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
   list: (
     actorId,
     owner?,
   ) => Promise<KeyOutcome<readonly KeyRecord<Capability>[]>>;
-  read: (actorId, keyId) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
-  updateGrants: (actorId, input) => Promise<KeyOutcome<KeyRecord<Capability>>>;
+  updateGrants: (
+    actorId,
+    input,
+    parent?,
+  ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   revoke: (actorId, input) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   suspendOwner: (owner, requestId) => Promise<KeyOutcome<void>>;
-  revokeAll: (closedAt) => Promise<KeyOutcome<void>>;
+  close: (closedAt) => KeyOutcome<void>;
   admitUse: (principal, input) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
   touch: (keyId) => Promise<KeyOutcome<void>>;
 }>;
@@ -376,7 +438,60 @@ The operations one key store exposes over its tenant's keys.
 | ------------------------------- |
 | `Capability` _extends_ `string` |
 
+## Variables
+
+### keyRefusalCodes
+
+```ts
+const keyRefusalCodes: readonly [
+  "invalid",
+  "denied",
+  "conflict",
+  "expired",
+  "rate_limited",
+  "unavailable",
+];
+```
+
+The closed refusal vocabulary used by key-owner outcomes and transport decoders.
+
+---
+
+### keyRefusalSchema
+
+```ts
+const keyRefusalSchema: z.ZodType<KeyRefusal>;
+```
+
+Closed key-owner refusals crossing JSON or RPC transports.
+
 ## Functions
+
+### keyWire()
+
+```ts
+function keyWire<Capability>(vocabulary): KeyWire<Capability>;
+```
+
+One wire grammar for both Hub and standalone Oyster key transports.
+
+#### Type Parameters
+
+| Type Parameter                  |
+| ------------------------------- |
+| `Capability` _extends_ `string` |
+
+#### Parameters
+
+| Parameter    | Type                                                           |
+| ------------ | -------------------------------------------------------------- |
+| `vocabulary` | [`GrantVocabulary`](grants.md#grantvocabulary)\<`Capability`\> |
+
+#### Returns
+
+[`KeyWire`](#keywire)\<`Capability`\>
+
+---
 
 ### createKeyStore()
 

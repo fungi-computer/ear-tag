@@ -223,7 +223,8 @@ export function defineGrants<
   ): boolean =>
     grants.some(
       (grant) =>
-        grant.capability === capability &&
+        (grant.capability === capability ||
+          implies.get(grant.capability)?.includes(capability) === true) &&
         (grant.targets.kind === "all" || grant.targets.ids.length > 0),
     );
 
