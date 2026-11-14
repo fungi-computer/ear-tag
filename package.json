@@ -32,23 +32,13 @@
     "LICENSE"
   ],
   "scripts": {
-    "lint": "eslint src test --max-warnings=0 && ../../node_modules/.bin/oxlint --config ../../oxlint.config.ts --deny-warnings src test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "clean": "node --input-type=module --eval \"import { rm } from 'node:fs/promises'; await rm('dist', { recursive: true, force: true });\"",
-    "test": "pnpm run test:node && pnpm run test:cloudflare",
-    "test:node": "vitest run --config vitest.node.config.mjs",
-    "test:cloudflare": "vitest run --config vitest.cloudflare.config.mjs",
-    "docs": "tsx ../../tooling/repository/src/docs/cli.ts check --root ../..",
-    "docs:write": "tsx ../../tooling/repository/src/docs/cli.ts write --root ../..",
-    "pack": "mkdir -p ../../.botanical/ear-tag-pack && pnpm pack --pack-destination ../../.botanical/ear-tag-pack",
-    "smoke": "node --input-type=module -e \"import('./dist/index.js').then(({generateKey, hashKey}) => { const key = generateKey({ prefix: 'test' }); if (!key.startsWith('test_')) process.exit(1); return hashKey(key); }).then((hash) => { if (hash.length !== 64) process.exit(1); })\"",
-    "stranger": "tsx ../../tooling/repository/src/artifacts/cli.ts --repo-root ../.. .",
-    "format:check": "node ../../tooling/repository/scripts/format-package-check.mjs",
-    "lint:anti-slop": "node ../../tooling/repository/scripts/lint-package-anti-slop.mjs"
+    "smoke": "node --input-type=module -e \"import('./dist/index.js').then(({generateKey, hashKey}) => { const key = generateKey({ prefix: 'test' }); if (!key.startsWith('test_')) process.exit(1); return hashKey(key); }).then((hash) => { if (hash.length !== 64) process.exit(1); })\""
   },
   "dependencies": {
-    "@fungi.computer/cairn": "workspace:*",
+    "@fungi.computer/cairn": "0.1.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
