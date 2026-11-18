@@ -1,5 +1,70 @@
 # Ear Tag (`@fungi.computer/ear-tag`)
 
+Ear Tag creates secret keys, like API keys and invite codes, and stores only
+their hashes, with the grants, expiry and revocation you need around them.
+
+```mermaid
+flowchart LR
+  Host[Your host] -->|issue| EarTag[Ear Tag]
+  EarTag -->|plain key, shown once| Person[Person or Agent]
+  EarTag -->|digest| Store[(Your store)]
+  Person -->|presents key| EarTag
+  EarTag -->|grants, or refusal| Host
+```
+
+## Quick start
+
+Install it:
+
+```sh
+npm install @fungi.computer/ear-tag
+```
+
+This helper creates a prefixed key, stores its digest, then hands the plaintext
+to the host's authorized delivery function. The host supplies both operations;
+neither the key nor the digest is logged:
+
+```ts
+import { generateKeyAndHash } from "@fungi.computer/ear-tag";
+
+export async function issueInvite(
+  storeDigest: (digest: string) => Promise<void>,
+  deliverKey: (key: string) => Promise<void>,
+): Promise<void> {
+  const { key, digest } = await generateKeyAndHash({ prefix: "invite" });
+  await storeDigest(digest);
+  await deliverKey(key);
+}
+```
+
+The existing tests verify that a generated digest matches the plaintext key in
+[`test/crypto.test.ts`](test/crypto.test.ts).
+
+## Common tasks
+
+### Issue a key
+
+`generateKeyAndHash` returns the plaintext once and the digest to store. See the
+Quick start.
+
+### Describe what a key may do
+
+Build a typed grant vocabulary with `./grants`. See
+[Grants and the key store](#grants-and-the-key-store).
+
+### Verify, edit and revoke keys
+
+The `./keys` store handles expiry, suspension and per-key rate limits. See
+[Grants and the key store](#grants-and-the-key-store).
+
+### Look up the API
+
+See API reference.
+
+## Reference
+
+### Overview
+
 Ear Tag is an independent, modular key server for TypeScript hosts. Its base
 entrypoint creates cryptographically random bearer keys and SHA-256 digests, so
 a host can issue a secret like an invite code or an API key without inventing
@@ -23,28 +88,6 @@ primitives), `@fungi.computer/ear-tag/grants` (the grant vocabulary),
 `@fungi.computer/ear-tag/keys` (the key store, free of any Node-specific type)
 and `@fungi.computer/ear-tag/keys/node` (the `node:sqlite` adapter, so a Worker
 consumer of `./keys` never needs `@types/node` to typecheck).
-
-## Quick start
-
-This helper creates a prefixed key, stores its digest, then hands the plaintext
-to the host's authorized delivery function. The host supplies both operations;
-neither the key nor the digest is logged:
-
-```ts
-import { generateKeyAndHash } from "@fungi.computer/ear-tag";
-
-export async function issueInvite(
-  storeDigest: (digest: string) => Promise<void>,
-  deliverKey: (key: string) => Promise<void>,
-): Promise<void> {
-  const { key, digest } = await generateKeyAndHash({ prefix: "invite" });
-  await storeDigest(digest);
-  await deliverKey(key);
-}
-```
-
-The existing tests verify that a generated digest matches the plaintext key in
-[`test/crypto.test.ts`](test/crypto.test.ts).
 
 ## Core concepts
 
