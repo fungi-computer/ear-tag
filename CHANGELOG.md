@@ -1,5 +1,16 @@
 # @fungi.computer/ear-tag
 
+## 0.2.0
+
+### Minor Changes
+
+- Changes since 0.1.0:
+
+  - fix(hub): preserve named refusals and uniform mail admission
+  - fix(hub): preserve command refusals and refresh admission
+  - feat(hub): control commands per computer
+  - fix(hub): name a removed owner's key and an over-cap code as the cause
+
 ## 0.1.0
 
 ### Minor Changes

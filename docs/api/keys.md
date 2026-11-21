@@ -185,11 +185,12 @@ One closed refusal, carried as data rather than a thrown error type.
 
 `invalid` means the caller's own input failed the operation's schema; it is the
 caller's bug. `denied` means well-formed input was refused on its merits (no
-authority, revoked, suspended). `unavailable` means the store could not read
-back its own state (a corrupt row, a corrupt rate limit, or any other failure
-that is not one of the other closed reasons); that is the store's own fault,
-never the caller's, and every such failure is also logged before this outcome is
-returned.
+authority or revoked). `issuer_removed` means a live key's owner has left the
+tenant. `key_suspended` means its authority was permanently suspended; rejoining
+does not restore it. `unavailable` means the store could not read back its own
+state (a corrupt row, a corrupt rate limit, or any other failure that is not one
+of the other closed reasons); that is the store's own fault, never the caller's,
+and every such failure is also logged before this outcome is returned.
 
 ---
 
@@ -283,7 +284,9 @@ type CreateKeyStoreOptions<Capability> = Readonly<{
   commit: <Value>(body) => Promise<Value>;
   vocabulary: GrantVocabulary<Capability>;
   prefix: string;
-  authorizeIssuer: (actorId) => Promise<IssuerAuthority<Capability> | null>;
+  authorizeIssuer: (
+    actorId,
+  ) => Promise<IssuerAuthority<Capability> | "removed" | null>;
   delegation?: Readonly<{
     manage: Capability;
   }>;
@@ -413,6 +416,7 @@ type KeyStore<Capability> = Readonly<{
   verify: (secret) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
   current: (principal) => KeyOutcome<KeyPrincipal<Capability>>;
   live: (ref) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
+  ownerOf: (keyId) => string | null;
   list: (
     actorId,
     owner?,
@@ -446,6 +450,8 @@ The operations one key store exposes over its tenant's keys.
 const keyRefusalCodes: readonly [
   "invalid",
   "denied",
+  "issuer_removed",
+  "key_suspended",
   "conflict",
   "expired",
   "rate_limited",

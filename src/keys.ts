@@ -94,7 +94,9 @@ export type KeyPrincipal<Capability extends string> = Readonly<{
  *
  * `invalid` means the caller's own input failed the operation's schema; it
  * is the caller's bug. `denied` means well-formed input was refused on its
- * merits (no authority, revoked, suspended). `unavailable` means the store
+ * merits (no authority or revoked). `issuer_removed` means a live
+ * key's owner has left the tenant. `key_suspended` means its authority was
+ * permanently suspended; rejoining does not restore it. `unavailable` means the store
  * could not read back its own state (a corrupt row, a corrupt rate limit,
  * or any other failure that is not one of the other closed reasons); that
  * is the store's own fault, never the caller's, and every such failure is
@@ -178,7 +180,9 @@ export type CreateKeyStoreOptions<Capability extends string> = Readonly<{
   prefix: string;
   /**
    * Resolve one actor's authority to issue or edit keys, or `null` to deny
-   * the actor outright. The host owns actor identity, role checks, and
+   * the actor outright. `"removed"` says the actor has left the tenant: a key
+   * they own then refuses with `issuer_removed`, while their own management
+   * calls are `denied` as with `null`. The host owns actor identity, role checks, and
    * re-reading the human issuer's live authority. The store rechecks a
    * delegating key itself when `delegation` is enabled.
    *
@@ -190,7 +194,7 @@ export type CreateKeyStoreOptions<Capability extends string> = Readonly<{
    */
   authorizeIssuer: (
     actorId: string,
-  ) => Promise<IssuerAuthority<Capability> | null>;
+  ) => Promise<IssuerAuthority<Capability> | "removed" | null>;
   /** Enable key-issued keys using this vocabulary capability to manage keys. */
   delegation?: Readonly<{
     /** Capability a live parent must hold without a resource target to delegate keys. */
@@ -278,6 +282,8 @@ export type KeyStore<Capability extends string> = Readonly<{
   live: (
     ref: Readonly<{ keyId: string; grantVersion?: number }>,
   ) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;
+  /** Host-side issuer lookup inside a resource transaction; it grants no key-management authority. */
+  ownerOf: (keyId: string) => string | null;
   /** List every key, or every key owned by `owner`, once `actorId` is authorized to manage keys. */
   list: (
     actorId: string,
@@ -531,7 +537,7 @@ export function createKeyStore<Capability extends string>(
     requireOpen();
     if (record.scope === null) throw new Refusal("denied");
     if (record.revokedAt !== null) throw new Refusal("denied");
-    if (isSuspended(record.keyId)) throw new Refusal("denied");
+    if (isSuspended(record.keyId)) throw new Refusal("key_suspended");
     if (record.expiresAt !== null && record.expiresAt <= now())
       throw new Refusal("expired");
     return { ...record, scope: record.scope };
@@ -548,12 +554,17 @@ export function createKeyStore<Capability extends string>(
     expiresAt: record.expiresAt,
   });
 
+  /** `as: "owner"` checks a key's owner for its use; `"actor"` checks a caller. */
   const assertIssuer = async (
     actorId: string,
     grants: readonly Grant<Capability>[],
+    as: "owner" | "actor",
   ): Promise<void> => {
     const authority = await options.authorizeIssuer(actorId);
-    if (authority === null) throw new Refusal("denied");
+    if (authority === "removed" && as === "owner")
+      throw new Refusal("issuer_removed");
+    if (authority === null || authority === "removed")
+      throw new Refusal("denied");
     if (
       authority.kind === "bounded" &&
       !vocabulary.isSubset(grants, authority.grants)
@@ -601,7 +612,7 @@ export function createKeyStore<Capability extends string>(
     principal: KeyPrincipal<Capability>,
   ): Promise<KeyPrincipal<Capability>> => {
     const record = currentImpl(principal);
-    await assertIssuer(record.owner, record.scope.grants);
+    await assertIssuer(record.owner, record.scope.grants, "owner");
     return currentImpl(record);
   };
 
@@ -654,7 +665,7 @@ export function createKeyStore<Capability extends string>(
       .toArray()[0];
     if (row === undefined) throw new Refusal("denied");
     const record = requireActive(decode(row));
-    await assertIssuer(record.owner, record.scope.grants);
+    await assertIssuer(record.owner, record.scope.grants, "owner");
     const freshRecord = readById(record.keyId);
     if (freshRecord === null) throw new Refusal("denied");
     const fresh = requireActive(freshRecord);
@@ -689,7 +700,7 @@ export function createKeyStore<Capability extends string>(
     requireValidScope(grants);
     if (input.expiresAt !== undefined && input.expiresAt <= now())
       throw new Refusal("denied");
-    await assertIssuer(actorId, grants);
+    await assertIssuer(actorId, grants, "actor");
     if (parent !== undefined) {
       await currentLiveImpl(parent);
       assertParent(actorId, grants, parent, input.expiresAt ?? null);
@@ -848,7 +859,7 @@ export function createKeyStore<Capability extends string>(
     const input = wire.updateGrants.parse(rawInput);
     const grants = vocabulary.canonicalGrants(input.grants);
     requireValidScope(grants);
-    await assertIssuer(actorId, grants);
+    await assertIssuer(actorId, grants, "actor");
     if (parent !== undefined) {
       await currentLiveImpl(parent);
       assertParent(actorId, grants, parent);
@@ -906,7 +917,8 @@ export function createKeyStore<Capability extends string>(
   ): Promise<KeyRecord<Capability>> => {
     const input = wire.revoke.parse(rawInput);
     const authority = await options.authorizeIssuer(actorId);
-    if (authority === null) throw new Refusal("denied");
+    if (authority === null || authority === "removed")
+      throw new Refusal("denied");
     ensure();
     const inputKey = JSON.stringify({ keyId: input.keyId });
     const preflight = (): KeyRecord<Capability> => {
@@ -950,7 +962,8 @@ export function createKeyStore<Capability extends string>(
     owner?: string,
   ): Promise<readonly KeyRecord<Capability>[]> => {
     const authority = await options.authorizeIssuer(actorId);
-    if (authority === null) throw new Refusal("denied");
+    if (authority === null || authority === "removed")
+      throw new Refusal("denied");
     ensure();
     const rows =
       owner === undefined
@@ -1128,6 +1141,7 @@ export function createKeyStore<Capability extends string>(
     verify: (secret) => boundary(() => verifyImpl(secret)),
     current: (principal) => syncBoundary(() => currentImpl(principal)),
     live: (ref) => boundary(() => liveImpl(ref)),
+    ownerOf: (keyId) => readById(z.string().min(1).parse(keyId))?.owner ?? null,
     list: (actorId, owner) => boundary(() => listImpl(actorId, owner)),
     updateGrants: (actorId, input, parent) =>
       boundary(() => updateGrantsImpl(actorId, input, parent)),

@@ -89,6 +89,10 @@ export class KeyStoreDO extends DurableObject {
     return this.#store.current(principal);
   }
 
+  ownerOf(keyId) {
+    return this.#store.ownerOf(keyId);
+  }
+
   list(actorId, owner) {
     return this.#store.list(actorId, owner);
   }

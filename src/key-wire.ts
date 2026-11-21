@@ -18,6 +18,8 @@ export const rateLimitSchema = z.strictObject({
 export const keyRefusalCodes = [
   "invalid",
   "denied",
+  "issuer_removed",
+  "key_suspended",
   "conflict",
   "expired",
   "rate_limited",

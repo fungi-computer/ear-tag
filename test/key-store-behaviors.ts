@@ -30,6 +30,27 @@ function idRange(prefix: string, count: number): readonly string[] {
 export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
   const create = (policy?: FixturePolicy) => createFixture(policy);
 
+  it("reads a key's recorded issuer synchronously for host resource selection, including revoked keys", async () => {
+    const { store, close } = await create();
+    try {
+      expect(await store.ownerOf("missing-key")).toBeNull();
+      const issued = await store.issue("owner-a", {
+        name: "issuer lookup",
+        grants: [readGrant],
+      });
+      if (issued.kind !== "ok") throw new Error("issue failed");
+      const keyId = issued.value.record.keyId;
+      expect(await store.ownerOf(keyId)).toBe("owner-a");
+      await store.revoke("owner-a", {
+        requestId: "lookup-after-revoke",
+        keyId,
+      });
+      expect(await store.ownerOf(keyId)).toBe("owner-a");
+    } finally {
+      await close();
+    }
+  });
+
   const epochFailures: readonly EpochFailure[] = [
     "begin",
     "before-commit",
@@ -538,7 +559,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       await store.suspendOwner("owner-a", "suspend-human");
       expect(await store.verify(child.value.key)).toEqual({
         kind: "error",
-        error: { code: "denied" },
+        error: { code: "key_suspended" },
       });
     } finally {
       await close();
@@ -847,7 +868,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
         capability: "files.read",
         requestId: "req-use-suspended",
       });
-      expect(used).toEqual({ kind: "error", error: { code: "denied" } });
+      expect(used).toEqual({ kind: "error", error: { code: "key_suspended" } });
     } finally {
       await close();
     }
@@ -870,11 +891,11 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       expect(suspension.kind).toBe("ok");
       expect(await store.verify(first.value.key)).toEqual({
         kind: "error",
-        error: { code: "denied" },
+        error: { code: "key_suspended" },
       });
       expect(await store.verify(second.value.key)).toEqual({
         kind: "error",
-        error: { code: "denied" },
+        error: { code: "key_suspended" },
       });
     } finally {
       await close();
@@ -1347,7 +1368,7 @@ export function registerKeyStoreBehaviors(createFixture: CreateFixture): void {
       expect(suspension.kind).toBe("ok");
 
       const read = await store.live({ keyId: issued.value.record.keyId });
-      expect(read).toEqual({ kind: "error", error: { code: "denied" } });
+      expect(read).toEqual({ kind: "error", error: { code: "key_suspended" } });
     } finally {
       await close();
     }

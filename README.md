@@ -160,6 +160,9 @@ still applies to both.
 row without spending a rate slot. A version pin refuses a stale grant set.
 `current(principal)` is synchronous for use inside a host resource transaction;
 it checks the row and version, not asynchronous human membership.
+`ownerOf(keyId)` synchronously reads the recorded issuer, including a revoked
+key, so a host can select that member's resource decisions in the same
+transaction as a permission change. It grants no key-management authority.
 `verify(secret)` consumes a rate slot; `admitUse` rechecks live authority and
 records an exact use receipt. Metadata reads never select the digest.
 

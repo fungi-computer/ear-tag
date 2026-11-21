@@ -55,8 +55,9 @@ function mutableClock(start: number) {
 /** A key-store test double, built the same way against every SQL backend. */
 export type TestFixture = Readonly<{
   /** SQL-host methods are synchronous locally; real DO RPC transports them asynchronously. */
-  store: Omit<KeyStore<TestCapability>, "current" | "close"> &
+  store: Omit<KeyStore<TestCapability>, "current" | "close" | "ownerOf"> &
     Readonly<{
+      ownerOf: (keyId: string) => string | null | Promise<string | null>;
       current: (
         principal: KeyPrincipal<TestCapability>,
       ) =>
