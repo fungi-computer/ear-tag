@@ -226,10 +226,13 @@ type IssuerAuthority<Capability> =
   | Readonly<{
       kind: "unrestricted";
     }>
-  | Readonly<{
+  | (Readonly<{
       kind: "bounded";
       grants: readonly Grant<Capability>[];
-    }>;
+    }> &
+      Readonly<{
+        attribution?: string;
+      }>);
 ```
 
 What an issuing actor may grant. `"unrestricted"` may grant any capability in
@@ -292,11 +295,35 @@ type CreateKeyStoreOptions<Capability> = Readonly<{
   }>;
   epoch?: AuthorityEpoch;
   onAuthorityChange?: (fence) => void;
+  onCommitted?: (event) => void;
   now?: () => number;
 }>;
 ```
 
 Construction options for [createKeyStore](#createkeystore).
+
+#### Type Parameters
+
+| Type Parameter                  |
+| ------------------------------- |
+| `Capability` _extends_ `string` |
+
+---
+
+### KeyCommittedEvent
+
+```ts
+type KeyCommittedEvent<Capability> = Readonly<{
+  kind: "issued" | "grants_changed" | "revoked";
+  actorId: string;
+  parentKeyId: string | null;
+  parentKeyName: string | null;
+  attribution: string | null;
+  record: KeyRecord<Capability>;
+}>;
+```
+
+One committed key change, as the store's `onCommitted` option receives it.
 
 #### Type Parameters
 
@@ -426,7 +453,11 @@ type KeyStore<Capability> = Readonly<{
     input,
     parent?,
   ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
-  revoke: (actorId, input) => Promise<KeyOutcome<KeyRecord<Capability>>>;
+  revoke: (
+    actorId,
+    input,
+    parent?,
+  ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   suspendOwner: (owner, requestId) => Promise<KeyOutcome<void>>;
   close: (closedAt) => KeyOutcome<void>;
   admitUse: (principal, input) => Promise<KeyOutcome<KeyPrincipal<Capability>>>;

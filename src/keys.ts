@@ -130,7 +130,7 @@ export type KeyOutcome<Value> = Readonly<
  * in the host's vocabulary; `"bounded"` may grant only a subset of its own
  * live grants, checked with the vocabulary's `isSubset`.
  */
-export type IssuerAuthority<Capability extends string> =
+export type IssuerAuthority<Capability extends string> = (
   | Readonly<{
       /** The actor may grant any capability in the host's vocabulary. */
       kind: "unrestricted";
@@ -140,7 +140,16 @@ export type IssuerAuthority<Capability extends string> =
       kind: "bounded";
       /** The actor's own live grants; every new grant must be their subset. */
       grants: readonly Grant<Capability>[];
-    }>;
+    }>
+) &
+  Readonly<{
+    /**
+     * The host's own record of what this admission was decided on, such as
+     * the actor's role. The store never reads it; it hands it back unchanged
+     * in the commit notification of the same request.
+     */
+    attribution?: string;
+  }>;
 
 /** One durable notice that a key's authority changed, for a host's own downstream fencing. */
 export type AuthorityFence = Readonly<{
@@ -204,8 +213,31 @@ export type CreateKeyStoreOptions<Capability extends string> = Readonly<{
   epoch?: AuthorityEpoch;
   /** Notified, inside the host's commit, whenever a key's authority changes. */
   onAuthorityChange?: (fence: AuthorityFence) => void;
+  /**
+   * Notified inside the host's commit, after a key is issued, its grants
+   * change, or it is first revoked, so the host can record who did it in the
+   * same transaction. A throw rolls the change back. A replay, a refusal and a
+   * repeat revocation are never notified.
+   */
+  onCommitted?: (event: KeyCommittedEvent<Capability>) => void;
   /** Clock override for tests; defaults to `Date.now`. */
   now?: () => number;
+}>;
+
+/** One committed key change, as the store's `onCommitted` option receives it. */
+export type KeyCommittedEvent<Capability extends string> = Readonly<{
+  /** Which change committed. */
+  kind: "issued" | "grants_changed" | "revoked";
+  /** The human the change was made under. */
+  actorId: string;
+  /** The key that delegated the change, when a key made it. */
+  parentKeyId: string | null;
+  /** That key's name when it made the change. */
+  parentKeyName: string | null;
+  /** The `attribution` the host's issuer admission returned for this request. */
+  attribution: string | null;
+  /** The key's record after the change; it carries no secret or digest. */
+  record: KeyRecord<Capability>;
 }>;
 
 /** Input to {@link KeyStore}'s `issue`. */
@@ -299,6 +331,8 @@ export type KeyStore<Capability extends string> = Readonly<{
   revoke: (
     actorId: string,
     input: RevokeInput,
+    /** The live key that delegated this revocation, when a key made it. */
+    parent?: KeyPrincipal<Capability>,
   ) => Promise<KeyOutcome<KeyRecord<Capability>>>;
   /** Permanently suspend every key owned by `owner`, for example on its departure. Commits its own write. */
   suspendOwner: (owner: string, requestId: string) => Promise<KeyOutcome<void>>;
@@ -559,7 +593,7 @@ export function createKeyStore<Capability extends string>(
     actorId: string,
     grants: readonly Grant<Capability>[],
     as: "owner" | "actor",
-  ): Promise<void> => {
+  ): Promise<IssuerAuthority<Capability>> => {
     const authority = await options.authorizeIssuer(actorId);
     if (authority === "removed" && as === "owner")
       throw new Refusal("issuer_removed");
@@ -570,6 +604,7 @@ export function createKeyStore<Capability extends string>(
       !vocabulary.isSubset(grants, authority.grants)
     )
       throw new Refusal("denied");
+    return authority;
   };
 
   type RateWindow = Readonly<{
@@ -700,7 +735,7 @@ export function createKeyStore<Capability extends string>(
     requireValidScope(grants);
     if (input.expiresAt !== undefined && input.expiresAt <= now())
       throw new Refusal("denied");
-    await assertIssuer(actorId, grants, "actor");
+    const authority = await assertIssuer(actorId, grants, "actor");
     if (parent !== undefined) {
       await currentLiveImpl(parent);
       assertParent(actorId, grants, parent, input.expiresAt ?? null);
@@ -734,7 +769,16 @@ export function createKeyStore<Capability extends string>(
       );
       const stored = readById(keyId);
       if (stored === null) throw new Refusal("unavailable");
-      return requireActive(stored);
+      const active = requireActive(stored);
+      options.onCommitted?.({
+        kind: "issued",
+        actorId,
+        parentKeyId: parent?.keyId ?? null,
+        parentKeyName: parent?.name ?? null,
+        attribution: authority.attribution ?? null,
+        record: active,
+      });
+      return active;
     });
     return { key: generated.key, record };
   };
@@ -859,7 +903,7 @@ export function createKeyStore<Capability extends string>(
     const input = wire.updateGrants.parse(rawInput);
     const grants = vocabulary.canonicalGrants(input.grants);
     requireValidScope(grants);
-    await assertIssuer(actorId, grants, "actor");
+    const authority = await assertIssuer(actorId, grants, "actor");
     if (parent !== undefined) {
       await currentLiveImpl(parent);
       assertParent(actorId, grants, parent);
@@ -900,6 +944,14 @@ export function createKeyStore<Capability extends string>(
         if (after.grantVersion !== input.expectedGrantVersion + 1)
           throw new Refusal("conflict");
         fence(input.requestId, "grants", after, current.grantVersion);
+        options.onCommitted?.({
+          kind: "grants_changed",
+          actorId,
+          parentKeyId: parent?.keyId ?? null,
+          parentKeyName: parent?.name ?? null,
+          attribution: authority.attribution ?? null,
+          record: after,
+        });
         recordMutationReceipt(input.requestId, {
           kind: "grants",
           actorId,
@@ -914,6 +966,7 @@ export function createKeyStore<Capability extends string>(
   const revokeImpl = async (
     actorId: string,
     rawInput: unknown,
+    parent: KeyPrincipal<Capability> | undefined,
   ): Promise<KeyRecord<Capability>> => {
     const input = wire.revoke.parse(rawInput);
     const authority = await options.authorizeIssuer(actorId);
@@ -946,6 +999,15 @@ export function createKeyStore<Capability extends string>(
         if (revoked === null) throw new Refusal("conflict");
         if (revoked.revokedAt === null) throw new Refusal("conflict");
         fence(input.requestId, "revoke", revoked);
+        if (current.revokedAt === null)
+          options.onCommitted?.({
+            kind: "revoked",
+            actorId,
+            parentKeyId: parent?.keyId ?? null,
+            parentKeyName: parent?.name ?? null,
+            attribution: authority.attribution ?? null,
+            record: revoked,
+          });
         recordMutationReceipt(input.requestId, {
           kind: "revoke",
           actorId,
@@ -1145,7 +1207,8 @@ export function createKeyStore<Capability extends string>(
     list: (actorId, owner) => boundary(() => listImpl(actorId, owner)),
     updateGrants: (actorId, input, parent) =>
       boundary(() => updateGrantsImpl(actorId, input, parent)),
-    revoke: (actorId, input) => boundary(() => revokeImpl(actorId, input)),
+    revoke: (actorId, input, parent) =>
+      boundary(() => revokeImpl(actorId, input, parent)),
     suspendOwner: (owner, requestId) =>
       boundary(() => suspendOwnerImpl(owner, requestId)),
     close: (closedAt) =>

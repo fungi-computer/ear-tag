@@ -1,5 +1,15 @@
 # @fungi.computer/ear-tag
 
+## 0.3.0
+
+### Minor Changes
+
+- Changes since 0.2.0:
+
+  - fix(hub): name the Team key behind an audited change and list newest first
+  - feat(ear-tag): hand the issuer's attribution back with each commit
+  - feat(ear-tag): notify the host of each committed key change
+
 ## 0.2.0
 
 ### Minor Changes
