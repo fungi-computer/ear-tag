@@ -1,5 +1,17 @@
 # @fungi.computer/ear-tag
 
+## 0.3.1
+
+### Patch Changes
+
+- Changes since 0.3.0:
+
+  - fix(deps): update the Cloudflare Vitest plugin to the release that exits
+    cleanly
+
+- Updated dependencies
+  - @fungi.computer/cairn@0.1.1
+
 ## 0.3.0
 
 ### Minor Changes

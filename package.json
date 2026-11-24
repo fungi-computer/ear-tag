@@ -1,6 +1,6 @@
 {
   "name": "@fungi.computer/ear-tag",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Levi <levi@technomancy.dev>",
   "description": "Worker-safe bearer-key generation and hashing primitives",
   "type": "module",
@@ -38,11 +38,11 @@
     "smoke": "node --input-type=module -e \"import('./dist/index.js').then(({generateKey, hashKey}) => { const key = generateKey({ prefix: 'test' }); if (!key.startsWith('test_')) process.exit(1); return hashKey(key); }).then((hash) => { if (hash.length !== 64) process.exit(1); })\""
   },
   "dependencies": {
-    "@fungi.computer/cairn": "0.1.0",
+    "@fungi.computer/cairn": "0.1.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "1.1.2",
+    "@cloudflare/vitest-plugin": "1.6.1",
     "@types/node": "24.13.3",
     "typescript": "5.9.3",
     "vitest": "4.1.11"
